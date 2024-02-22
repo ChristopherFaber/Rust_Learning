@@ -1,1 +1,0 @@
-/Users/chrisfaber/Desktop/Senior\ Classes/Operating\ Systems/Code/projects/guessing_game/mycrate/target/debug/mycrate: /Users/chrisfaber/Desktop/Senior\ Classes/Operating\ Systems/Code/projects/guessing_game/mycrate/src/main.rs
