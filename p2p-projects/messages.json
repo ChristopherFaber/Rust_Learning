@@ -1,0 +1,27 @@
+[
+    {
+      "id": 1,
+      "name": "Birthday",
+      "sender": "Alice",
+      "content": "Happy Birhtday!!:)",
+      "timestamp": 123456789,
+      "public": true
+    },
+    {
+      "id": 2,
+      "name": "TYSM!!",
+      "sender": "Bob",
+      "content": "Thank you",
+      "timestamp": 123456790,
+      "public": false
+    },
+    {
+      "id": 3,
+      "name": "Bob's Birthday?",
+      "sender": "Charlie",
+      "content": "Its your birthday? Oops, I forgot.",
+      "timestamp": 123456791,
+      "public": true
+    }
+  ]
+  
