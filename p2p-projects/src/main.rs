@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use tokio::{fs, io::AsyncBufReadExt, sync::mpsc};
 
-const STORAGE_FILE_PATH: &str = "./message.json";
+const STORAGE_FILE_PATH: &str = "./messages.json";
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
 type Messages = Vec<Message>; // Changed 'message' to 'Messages' for clarity
@@ -31,7 +31,7 @@ struct Message {
     name: String, // Added comma between fields
     sender: String,
     content: String,
-    timestamp: u64,
+   // timestamp: u64,
     public: bool,
 }
 
@@ -151,7 +151,7 @@ async fn create_new_message(name: &str, sender: &str, content: &str) -> Result<(
         name: name.to_owned(),
         sender: sender.to_owned(),
         content: content.to_owned(),
-        timestamp: 0,
+        // timestamp: 0,
         public: false,
     });
     write_local_messages(&local_messages).await?; // Changed 'message' to 'messages'
@@ -194,7 +194,7 @@ async fn main() {
     pretty_env_logger::init();
 
     info!("Peer Id: {}", PEER_ID.clone());
-    let (response_sender, mut response_rcv) = mpsc::unbounded_channel::<String>();
+    let (response_sender, mut response_rcv) = mpsc::unbounded_channel();
 
     let auth_keys = Keypair::<X25519Spec>::new()
         .into_authentic(&KEYS)
@@ -202,5 +202,141 @@ async fn main() {
 
     let transp = TokioTcpConfig::new()
         .upgrade(upgrade::Version::V1)
-        .authenticate(NoiseConfig::xx(auth_keys).into_authenticated());
+        .authenticate(NoiseConfig::xx(auth_keys).into_authenticated()) // XX Handshake pattern, IX exists as well and IK - only XX currently provides interop with other libp2p impls
+        .multiplex(mplex::MplexConfig::new())
+        .boxed();
+
+    let mut behaviour = MessageBehaviour {
+        floodsub: Floodsub::new(PEER_ID.clone()),
+        mdns: Mdns::new(Default::default())
+            .await
+            .expect("can create mdns"),
+        response_sender,
+    };
+
+    behaviour.floodsub.subscribe(TOPIC.clone());
+
+    let mut swarm = SwarmBuilder::new(transp, behaviour, PEER_ID.clone())
+        .executor(Box::new(|fut| {
+            tokio::spawn(fut);
+        }))
+        .build();
+
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+
+    Swarm::listen_on(
+        &mut swarm,
+        "/ip4/0.0.0.0/tcp/0"
+            .parse()
+            .expect("can get a local socket"),
+    )
+    .expect("swarm can be started");
+
+    loop {
+        let evt = {
+            tokio::select! {
+                line = stdin.next_line() => Some(EventType::Input(line.expect("can get line").expect("can read line from stdin"))),
+                response = response_rcv.recv() => Some(EventType::Response(response.expect("response exists"))),
+                event = swarm.select_next_some() => {
+                    info!("Unhandled Swarm Event: {:?}", event);
+                    None
+                },
+            }
+        };
+
+        if let Some(event) = evt {
+            match event {
+                EventType::Response(resp) => {
+                    let json = serde_json::to_string(&resp).expect("can jsonify response");
+                    swarm
+                        .behaviour_mut()
+                        .floodsub
+                        .publish(TOPIC.clone(), json.as_bytes());
+                }
+                EventType::Input(line) => match line.as_str() {
+                    "ls p" => handle_list_peers(&mut swarm).await,
+                    cmd if cmd.starts_with("ls m") => handle_list_messages(cmd, &mut swarm).await,
+                    cmd if cmd.starts_with("create m") => handle_create_message(cmd).await,
+                    cmd if cmd.starts_with("publish m") => handle_publish_message(cmd).await,
+                    _ => error!("unknown command"),
+                },
+            }
+        }
+    }
+}
+
+async fn handle_list_peers(swarm: &mut Swarm<MessageBehaviour>) {
+    info!("Discovered Peers:");
+    let nodes = swarm.behaviour().mdns.discovered_nodes();
+    let mut unique_peers = HashSet::new();
+    for peer in nodes {
+        unique_peers.insert(peer);
+    }
+    unique_peers.iter().for_each(|p| info!("{}", p));
+}
+
+async fn handle_list_messages(cmd: &str, swarm: &mut Swarm<MessageBehaviour>) {
+    let rest = cmd.strip_prefix("ls r ");
+    match rest {
+        Some("all") => {
+            let req = ListRequest {
+                mode: ListMode::ALL,
+            };
+            let json = serde_json::to_string(&req).expect("can jsonify request");
+            swarm
+                .behaviour_mut()
+                .floodsub
+                .publish(TOPIC.clone(), json.as_bytes());
+        }
+        Some(messages_peer_id) => {
+            let req = ListRequest {
+                mode: ListMode::One(messages_peer_id.to_owned()),
+            };
+            let json = serde_json::to_string(&req).expect("can jsonify request");
+            swarm
+                .behaviour_mut()
+                .floodsub
+                .publish(TOPIC.clone(), json.as_bytes());
+        }
+        None => {
+            match read_local_messages().await {
+                Ok(v) => {
+                    info!("Local Messages ({})", v.len());
+                    v.iter().for_each(|r| info!("{:?}", r));
+                }
+                Err(e) => error!("error fetching local messages: {}", e),
+            };
+        }
+    };
+}
+
+async fn handle_create_message(cmd: &str) {
+    if let Some(rest) = cmd.strip_prefix("create r") {
+        let elements: Vec<&str> = rest.split("|").collect();
+        if elements.len() < 3 {
+            info!("too few arguments - Format: name|sender|content");
+        } else {
+            let name = elements.get(0).expect("name is there");
+            let sender = elements.get(1).expect("sender is there");
+            let content = elements.get(2).expect("content is there");
+            if let Err(e) = create_new_message(name, sender, content).await {
+                error!("error creating message: {}", e);
+            };
+        }
+    }
+}
+
+async fn handle_publish_message(cmd: &str) {
+    if let Some(rest) = cmd.strip_prefix("publish r") {
+        match rest.trim().parse::<usize>() {
+            Ok(id) => {
+                if let Err(e) = publish_message(id).await {
+                    info!("error publishing message with id {}, {}", id, e)
+                } else {
+                    info!("Published Message with id: {}", id);
+                }
+            }
+            Err(e) => error!("invalid id: {}, {}", rest.trim(), e),
+        };
+    }
 }
